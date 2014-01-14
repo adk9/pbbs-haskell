@@ -1,6 +1,6 @@
 
 import System.Environment (getArgs)
-import Control.LVish
+import Control.Monad.Par.Combinator
 
 main = do  
   [arg] <- getArgs

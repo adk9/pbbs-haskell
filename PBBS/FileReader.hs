@@ -27,9 +27,7 @@ import Control.DeepSeq (NFData,rnf)
 import Control.Exception (evaluate)
 import Control.Monad (unless)
 import Control.Concurrent (getNumCapabilities)
-import Control.LVish as LV
-import Control.LVish.Internal (liftIO)
-import qualified Data.LVar.IVar as I
+import Control.Monad.Par
 
 import Data.Word
 import Data.Char (isSpace)
@@ -160,8 +158,8 @@ parReadNats chunks bs = par
       return [partial]
     reducer a b = return (a++b) -- Quadratic, but just at the chunk level.
 
-    par :: LV.Par d s [PartialNums nty]
-    par = do _ <- I.new
+    par :: Par d s [PartialNums nty]
+    par = do _ <- new
              parMapReduceRangeThresh 1 (InclusiveRange 0 (chunks - 1))
                                   mapper reducer []              
 
@@ -524,9 +522,9 @@ parMapReduceRangeThresh threshold (InclusiveRange min max) fn binop init
 
     | otherwise  = do
 	let mid = min + ((max - min) `quot` 2)
-	rght <- I.spawn $ loop (mid+1) max
+	rght <- spawn $ loop (mid+1) max
 	l  <- loop  min    mid
-	r  <- I.get rght
+	r  <- get rght
 	l `binop` r
 
 -- How many tasks per process should we aim for?  Higher numbers
