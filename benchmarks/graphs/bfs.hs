@@ -8,12 +8,8 @@ import PBBS.FileReader
 import PBBS.Timing (wait_clocks, runAndReport)
 -- calibrate, measureFreq, commaint,
 
-import Control.LVish
-import Control.LVish.Internal
-import Control.LVish.DeepFrz (runParThenFreezeIO)
-import qualified Control.LVish.SchedIdempotent as L
-
 import Control.Monad
+import Control.Monad.Par
 import Control.Monad.Par.Combinator (parFor, InclusiveRange(..))
 import Control.Monad.ST
 import Control.Exception
@@ -21,7 +17,6 @@ import GHC.Conc
 
 import Data.Word
 import Data.Maybe
-import Data.LVar.MaxCounter as C
 import Data.Time.Clock
 import qualified Data.Traversable as T
 import qualified Data.Vector as V
@@ -39,19 +34,16 @@ import System.Process
 
 --------------------------------------------------------------------------------
 
-#if 1
-import Data.LVar.PureSet as S
-#else
--- [2013.07.09] This one still isn't terminating on 125K+
---  Well, maybe it's just slow... 5000 takes 2 seconds.
---  Yes, it's literally over 100 times slower currently.
-import Data.LVar.SLSet as S
-#endif
+-- import Data.LVar.MaxCounter as C
+-- #if 1
+-- import Data.LVar.PureSet as S
+-- #else
+-- import Data.LVar.SLSet as S
+-- #endif
 
-import qualified Data.LVar.SLSet as SL
+-- import qualified Data.LVar.SLSet as SL
 
-import Data.LVar.IStructure as ISt
-import Data.LVar.NatArray as NArr
+-- import Data.LVar.NatArray as NArr
 
 -- An LVar-based version of bf_traverse.  As we traverse the graph,
 -- the results of applying f to each node accumulate in an LVar, where
@@ -154,14 +146,14 @@ bfs_async gr@(AdjacencyGraph vvec evec) start = do
 
 
 -- | A version that uses an array rather than set representation.
-bfs_async_arr :: AdjacencyGraph -> NodeID -> Par d s (IStructure s Bool)
+bfs_async_arr :: AdjacencyGraph -> NodeID -> Par (IVar Bool)
 bfs_async_arr gr@(AdjacencyGraph vvec evec) start = do 
-  arr <- newIStructure (U.length vvec)
+  arr <- new (U.length vvec)
   let callback nd bool = do
        let myNbrs = nbrs gr (fromIntegral nd)        
        logDbgLn 1 $" [bfs] expanding node "++show (nd,bool)++" to nbrs " ++ show myNbrs
        -- TODO: possibly use a better for loop:
-       forVec myNbrs (\nbr -> ISt.put_ arr (fromIntegral nbr) True)
+       forVec myNbrs (\nbr -> put_ arr (fromIntegral nbr) True)
   ISt.forEachHP Nothing arr callback
   logDbgLn 1 $" [bfs] Seeding with start vertex... "
   ISt.put_ arr (fromIntegral start) True
@@ -272,173 +264,6 @@ workEachVecMayb clocks vec = do
       liftIO$ wait_clocks clocks
       return ()
 
-
-------------------------------------------------------------------------------------------
--- Maximal Independent Set
-------------------------------------------------------------------------------------------  
-
--- Lattice where undecided = bot, and chosen/nbrchosen are disjoint middle states
-flag_UNDECIDED :: Word8
-flag_CHOSEN    :: Word8
-flag_NBRCHOSEN :: Word8
-flag_UNDECIDED = 0
-flag_CHOSEN    = 1
-flag_NBRCHOSEN = 2
-
-{-# INLINE maximalIndependentSet #-}
--- maximalIndependentSet :: ISet s NodeID -> Par d s (ISet s NodeID)  -- Operate on a subgraph
--- maximalIndependentSet :: AdjacencyGraph -> Par d s (ISet s NodeID) -- Operate on a whole graph.
-maximalIndependentSet :: ParFor d s -> AdjacencyGraph -> Par d s (NatArray s Word8) -- Operate on a whole graph.
-maximalIndependentSet parFor gr@(AdjacencyGraph vvec evec) = do
-  -- For each vertex, we record whether it is CHOSEN, not chosen, or undecided:
-  let numVerts = U.length vvec
-  flagsArr :: NatArray s Word8 <- newNatArray numVerts
-  let       
-      -- Here's the loop that scans through the neighbors of a node.
-      loop !numNbrs !nbrs !selfInd !i 
-        | i == numNbrs = thisNodeWins
-        | otherwise = do
-          -- logDbgLn 1$ " [MIS]   ... on nbr "++ show i++" of "++show numNbrs
-          let nbrInd = fromIntegral$ nbrs U.! i -- Find our Nbr's NodeID
-              selfInd' = fromIntegral selfInd
-          -- If we got to the end of the neighbors below us, then we are NOT disqualified:
-          if nbrInd > selfInd
-            then thisNodeWins
-            else do
-              -- This should never block in a single-thread execution:
-              logDbgLn 1 (" [MIS] ! Getting on nbrInd "++show nbrInd)
-              nbrFlag <- NArr.get flagsArr (fromIntegral nbrInd)
-              logDbgLn 1 (" [MIS] ! Get completed on nbrInd "++show nbrInd)
-              if nbrFlag == flag_CHOSEN
-                then NArr.put flagsArr selfInd' flag_NBRCHOSEN
-                else loop numNbrs nbrs selfInd (i+1)
-        where
-          thisNodeWins = logDbgLn 1 (" [MIS] ! Node chosen: "++show selfInd) >> 
-                         NArr.put flagsArr (fromIntegral selfInd) flag_CHOSEN
-  parFor (0,numVerts) $ \ ndIx -> do 
-      let nds = nbrs gr (fromIntegral ndIx)
-      -- logDbgLn 1$ " [MIS] processing node "++show ndIx++" nbrs "++show nds
-      loop (U.length nds) nds ndIx  0
-  return flagsArr
-
--- | DUPLICATE CODE: IStructure version.
-maximalIndependentSet2 :: ParFor d s -> AdjacencyGraph -> Par d s (IStructure s Word8) -- Operate on a whole graph.
-maximalIndependentSet2 parFor gr@(AdjacencyGraph vvec evec) = do
-  logDbgLn 1$ " [MIS] Beginning maximalIndependentSet / Istructures"
-  -- For each vertex, we record whether it is CHOSEN, not chosen, or undecided:
-  let numVerts = U.length vvec
-  flagsArr <- newIStructure numVerts
-  let       
-      -- Here's the loop that scans through the neighbors of a node.
-      loop !numNbrs !nbrs !selfInd !i 
-        | i == numNbrs = thisNodeWins
-        | otherwise = do
-          -- logDbgLn 1$ " [MIS]   ... on nbr "++ show i++" of "++show numNbrs
-          let nbrInd = fromIntegral$ nbrs U.! i -- Find our Nbr's NodeID
-              selfInd' = fromIntegral selfInd
-          -- If we got to the end of the neighbors below us, then we are NOT disqualified:
-          if nbrInd > selfInd
-            then thisNodeWins
-            else do
-              -- This should never block in a single-thread execution:
-              logDbgLn 1 (" [MIS] ! Getting on nbrInd "++show nbrInd)
-              nbrFlag <- ISt.get flagsArr (fromIntegral nbrInd)
-              logDbgLn 1 (" [MIS] ! Get completed on nbrInd "++show nbrInd)
-              if nbrFlag == flag_CHOSEN
-                then ISt.put_ flagsArr selfInd' flag_NBRCHOSEN
-                else loop numNbrs nbrs selfInd (i+1)
-        where
-          thisNodeWins = logDbgLn 1 (" [MIS] ! Node chosen: "++show selfInd) >> 
-                         ISt.put_ flagsArr (fromIntegral selfInd) flag_CHOSEN
-  parFor (0,numVerts) $ \ ndIx -> do 
-      let nds = nbrs gr (fromIntegral ndIx)
-      -- logDbgLn 1$ " [MIS] processing node "++show ndIx++" nbrs "++show nds
-      loop (U.length nds) nds ndIx  0
-  return flagsArr
-
-
--- | Sequential version.
-maximalIndependentSet3 :: AdjacencyGraph -> (U.Vector Word8)
-maximalIndependentSet3 gr@(AdjacencyGraph vvec evec) = U.create $ do
-  let numVerts = U.length vvec
-  flagsArr <- M.replicate numVerts 0
-  let loop !numNbrs !nbrs !selfInd !i 
-        | i == numNbrs = thisNodeWins
-        | otherwise = do
-          let nbrInd   = fromIntegral$ nbrs U.! i -- Find our Nbr's NodeID
-              selfInd' = fromIntegral selfInd
-          if nbrInd > selfInd
-            then thisNodeWins
-            else do
-              nbrFlag <- M.read flagsArr (fromIntegral nbrInd)
-              if nbrFlag == flag_CHOSEN
-                then M.write flagsArr selfInd' flag_NBRCHOSEN
-                else loop numNbrs nbrs selfInd (i+1)
-        where
-          thisNodeWins = M.write flagsArr (fromIntegral selfInd) flag_CHOSEN
-  for_ (0,numVerts) $ \ ndIx -> do 
-      let nds = nbrs gr (fromIntegral ndIx)
-      loop (U.length nds) nds ndIx 0
-  return flagsArr
-
--- | Sequential version on NatArray...
-maximalIndependentSet3B :: AdjacencyGraph -> (UV.Vector Word8) -> (UV.Vector Word8)
-maximalIndependentSet3B gr@(AdjacencyGraph vvec evec) vec = UV.create $ do
-  let numVerts = U.length vvec
-  flagsArr <- MV.replicate numVerts 0
-  let loop !numNbrs !nbrs !selfInd !i 
-        | i == numNbrs = thisNodeWins
-        | otherwise = do
-          let nbrInd   = fromIntegral$ nbrs U.! i -- Find our Nbr's NodeID
-              selfInd' = fromIntegral selfInd
-          if nbrInd > selfInd
-            then thisNodeWins
-            else do
-              nbrFlag <- MV.read flagsArr (fromIntegral nbrInd)
-              if nbrFlag == flag_CHOSEN
-                then MV.write flagsArr selfInd' flag_NBRCHOSEN
-                else loop numNbrs nbrs selfInd (i+1)
-        where
-          thisNodeWins = MV.write flagsArr (fromIntegral selfInd) flag_CHOSEN
-  for_ (0,numVerts) $ \ ndIx -> 
-      when (vec UV.! ndIx == 1) $ do 
-        let nds = nbrs gr (fromIntegral ndIx)
-        loop (U.length nds) nds ndIx 0
-  return flagsArr
-
-
--- MIS over a preexisting, filtered subgraph
-------------------------------------------------------------
--- Right now this uses an IStructure because it's (temporarily) better at blocking gets:
-maximalIndependentSet4 :: AdjacencyGraph -> (NatArray s Word8) -> Par d s (IStructure s Word8)
-maximalIndependentSet4 gr@(AdjacencyGraph vvec evec) vertSubset = do
-  let numVerts = U.length vvec
-  -- Tradeoff: we use storage proportional to the ENTIRE graph.  If the subset is
-  -- very small, this is silly and we could use a sparse representation:
-  flagsArr <- newIStructure numVerts
-  let       
-      -- Here's the loop that scans through the neighbors of a node.
-      loop !numNbrs !nbrs !selfInd !i 
-        | i == numNbrs = thisNodeWins
-        | otherwise = do
-          let nbrInd   = fromIntegral$ nbrs U.! i -- Find our Nbr's NodeID
-              selfInd' = fromIntegral selfInd
-          -- If we got to the end of the neighbors below us, then we are NOT disqualified:
-          if nbrInd > selfInd
-            then thisNodeWins
-            else do
-              nbrFlag <- ISt.get flagsArr (fromIntegral nbrInd)
-              if nbrFlag == flag_CHOSEN
-                then ISt.put_ flagsArr selfInd' flag_NBRCHOSEN
-                else loop numNbrs nbrs selfInd (i+1)
-        where
-          thisNodeWins = ISt.put_ flagsArr (fromIntegral selfInd) flag_CHOSEN
-          
-  NArr.forEach vertSubset $ \ ndIx _ -> 
-        let nds = nbrs gr (fromIntegral ndIx) in
-        loop (U.length nds) nds ndIx  0
-  return flagsArr
-
 --------------------------------------------------------------------------------
 -- Misc helpers
 --------------------------------------------------------------------------------
@@ -453,18 +278,15 @@ forVec vec fn = loop 0
            | otherwise = fn (U.unsafeIndex vec i) >>
                          loop (i+1)
 
-type ParFor d s = (Int,Int) -> (Int -> Par d s ()) -> Par d s ()
-
 --------------------------------------------------------------------------------
 -- Main Program
 --------------------------------------------------------------------------------
   
 main = do
-  putStrLn "USAGE: ./bfs_lvish <version> <topo> <graphSize>"
+  putStrLn "USAGE: ./bfs <version> <topo> <graphSize>"
   putStrLn "USAGE:   Topo must be one of: grid rmat rand chain"
   putStrLn "USAGE:   Version must be one of: "
   putStrLn "USAGE:      bfsS bfsN bfsI"
-  putStrLn "USAGE:      misN1 misN2 misN3 misI3 misSeq" 
   
   --------------------------------------------------------------------------------
   args <- getArgs
@@ -553,8 +375,8 @@ main = do
                        par2 = do comp <- bfs_async gr 0
                                  waitSize numVerts comp -- A proxy for completeness... assumes fully connected graph.
                                  return comp
-                   _ <- runParIO_ par2
-                   -- set:: Snapshot ISet NodeID <- runParThenFreezeIO par2
+                   _ <- runParIO par2
+                   -- set:: Snapshot ISet NodeID <- runParIO par2
                    -- let ISetSnap s = set                                          
                    -- putStrLn$ "Connected component, set size "++show (Set.size s)
                    return ()
@@ -564,7 +386,7 @@ main = do
                    let -- par2 :: Par d0 s0 (ISet s0 NodeID)
                        par3 :: Par d0 s0 (IStructure s0 Bool)
                        par3 = bfs_async_arr gr 0
-                   _ <- runParIO_ par3
+                   _ <- runParIO par3
                    return ()
 
       ----------------------------------------
@@ -572,84 +394,16 @@ main = do
                    let -- par2 :: Par d0 s0 (ISet s0 NodeID)
                        par4 :: Par d0 s0 (NatArray s0 Word8)
                        par4 = bfs_async_arr2 gr 0
-                   _ <- runParIO_ par4
+                   _ <- runParIO par4
                    return ()
 {-
-      ----------------------------------------
-      "misN1" -> do 
-              putStrLn " ! Version 5: MIS only, with NatArrays / parForSimple"
-              let par :: Par d0 s0 (NatArray s0 Word8)
-                  par = maximalIndependentSet parForSimple gr
-#ifdef DEBUG_CHECKS
-              NatArraySnap (x :: UV.Vector Word8) <- runParThenFreezeIO par
-              putStrLn$ "MIS: result prefix: "++show (UV.take 100 x)
-              putStrLn$ "MIS: number of vertices in result: "++show (UV.sum (UV.filter (==1) x))
-#else
-              _ <- runParIO_ par
-#endif
-              return ()
-
-      ----------------------------------------
-      "misN2" -> do 
-              putStrLn " ! Version 6: MIS only, with NatArrays / parForTree"
-              let par :: Par d0 s0 (NatArray s0 Word8)
-                  par = maximalIndependentSet parForTree gr
-              _ <- runParIO_ par
-              return ()
-
-      ----------------------------------------
-      "misN3" -> do 
-              putStrLn " ! Version 7: MIS only, with NatArrays / parForL"
-              let par :: Par d0 s0 (NatArray s0 Word8)
-                  par = maximalIndependentSet parForL gr
-              _ <- runParIO_ par
-              return ()
-
-      ----------------------------------------
-      "misI3" -> do 
-              putStrLn " ! Version 8: MIS only, with IStructures / parForL"
-              let par :: Par d0 s0 (IStructure s0 Word8)
-                  par = maximalIndependentSet2 parForL gr
-              _ <- runParIO_ par
-              return ()
-      -- This version doesn't get the horrible parallel slowdown of version 5-7.
-      -- But alas, version 7 sequential is better.
-      -- And version 9 sequential is WAY better (>50X faster)
-
-      ----------------------------------------
-      "misSeq" -> do 
-              putStrLn " ! Version 9: MIS only, sequential"
-              evaluate $ maximalIndependentSet3 gr
-              return ()
-
-
-      ----------------------------------------
-      "bfsN_misI" -> do 
-              putStrLn " ! Version 10: BFS and then MIS w/ NatArrays/IStructure"
-              let par :: Par d0 s0 (IStructure s0 Word8)
-                  par = do natarr <- bfs_async_arr2 gr 0
-                           maximalIndependentSet4 gr natarr
-              _ <- runParIO_ par
-              return ()
-
-      ----------------------------------------
-      "bfsN_misI_deg" -> do 
-              putStrLn " ! Version 11: BFS, MIS, and maxDegree"
-              let par :: Par d0 s0 (MaxCounter s0)
-                  par = do natarr <- bfs_async_arr2 gr 0
-                           narr2 <- maximalIndependentSet4 gr natarr
-                           maxDegreeI gr narr2
-              mx <- runParThenFreezeIO par
-              putStrLn$ "Max degree in MIS was: "++show(mx::Int)
-
-
       ----------------------------------------
       "bfsN_work" -> do
               putStrLn " ! Version 12: BFS and per-vertex work"
               let par :: Par d0 s0 ()
                   par = do natarr <- bfs_async_arr2 gr 0
                            workEachNode amountWork natarr
-              _ <- runParIO_ par
+              _ <- runParIO par
               return ()
 
       ----------------------------------------
@@ -657,8 +411,8 @@ main = do
               putStrLn " ! Version 13: BFS, barrier, and per-vertex work"
               let -- par :: Par d0 s0 ()
                   par = bfs_async_arr2 gr 0
-              NatArraySnap vec <- runParThenFreezeIO par
-              runParIO_ $ workEachVec amountWork vec
+              NatArraySnap vec <- runParIO par
+              runParIO $ workEachVec amountWork vec
               return ()
 
 
@@ -668,7 +422,7 @@ main = do
               let par :: Par d0 s0 ()
                   par = do istrct <- maximalIndependentSet2 parForL gr
                            workEachNodeI amountWork istrct
-              _ <- runParIO_ par
+              _ <- runParIO par
               return ()
 
       ----------------------------------------
@@ -676,8 +430,8 @@ main = do
               putStrLn " ! Version 15: "
               let -- par :: Par d0 s0 ()
                   par = maximalIndependentSet2 parForL gr 
-              IStructSnap vec <- runParThenFreezeIO par
-              runParIO_ $ workEachVecMayb amountWork vec
+              IStructSnap vec <- runParIO par
+              runParIO $ workEachVecMayb amountWork vec
               return ()
 
       ----------------------------------------
@@ -687,16 +441,16 @@ main = do
                   par = do natarr <- bfs_async_arr2 gr 0
                            istrct <- maximalIndependentSet4 gr natarr
                            workEachNodeI amountWork istrct
-              _ <- runParIO_ par
+              _ <- runParIO par
               return ()
 
       ----------------------------------------
       "bfsN_barrier_misI_work" -> do
               putStrLn " ! Version 17: "
               let par = bfs_async_arr2 gr 0
-              NatArraySnap vec <- runParThenFreezeIO par
+              NatArraySnap vec <- runParIO par
               let vec2 = maximalIndependentSet3B gr vec -- Sequential
-              runParIO_ $ workEachVec amountWork vec2
+              runParIO $ workEachVec amountWork vec2
               return ()
 
       ----------------------------------------
@@ -707,7 +461,7 @@ main = do
                             liftIO$ putStrLn "Got component..."
                             mc <- maxDegreeS gr component    
                             return (mc,component)            
-              (maxdeg::Int, set:: Snapshot ISet NodeID) <- runParThenFreezeIO2 par1
+              (maxdeg::Int, set:: Snapshot ISet NodeID) <- runParIO par1
               putStrLn$ "Processing finished, max degree was: "++show maxdeg
               let ISetSnap s = set
               putStrLn$ "Connected component, set size "++show (Set.size s)
@@ -716,10 +470,3 @@ main = do
 
   putStrLn$ "Done"
   
-
--- runParIO_ :: (forall s . Par d s a) -> IO ()
--- runParIO_ p = do runParIO p; return ()
-
--- Unsafe version, fix this:
-runParIO_ :: (Par d s a) -> IO ()
-runParIO_ (WrapPar p) = L.runParIO p >> return ()
