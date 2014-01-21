@@ -1,0 +1,3 @@
+[submodule "pbbs-src"]
+	path = pbbs-src
+	url = https://github.com/iu-parfunc/pbbs.git
